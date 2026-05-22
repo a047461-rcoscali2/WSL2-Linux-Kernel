@@ -189,3 +189,4 @@ sphinx_*/
 modules-6.18.20.3-microsoft-standard-WSL2\+.vhdx
 
 modules/
+*.vhdx
