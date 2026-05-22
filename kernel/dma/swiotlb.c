@@ -30,6 +30,7 @@
 #include <linux/gfp.h>
 #include <linux/highmem.h>
 #include <linux/io.h>
+#include <linux/kmsan-checks.h>
 #include <linux/iommu-helper.h>
 #include <linux/init.h>
 #include <linux/memblock.h>
@@ -903,10 +904,19 @@ static void swiotlb_bounce(struct device *dev, phys_addr_t tlb_addr, size_t size
 
 			local_irq_save(flags);
 			page = pfn_to_page(pfn);
-			if (dir == DMA_TO_DEVICE)
+			if (dir == DMA_TO_DEVICE) {
+				/*
+				 * Ideally, kmsan_check_highmem_page()
+				 * could be used here to detect infoleaks,
+				 * but callers may map uninitialized buffers
+				 * that will be written by the device,
+				 * causing false positives.
+				 */
 				memcpy_from_page(vaddr, page, offset, sz);
-			else
+			} else {
+				kmsan_unpoison_memory(vaddr, sz);
 				memcpy_to_page(page, offset, vaddr, sz);
+			}
 			local_irq_restore(flags);
 
 			size -= sz;
@@ -915,8 +925,15 @@ static void swiotlb_bounce(struct device *dev, phys_addr_t tlb_addr, size_t size
 			offset = 0;
 		}
 	} else if (dir == DMA_TO_DEVICE) {
+		/*
+		 * Ideally, kmsan_check_memory() could be used here to detect
+		 * infoleaks (uninitialized data being sent to device), but
+		 * callers may map uninitialized buffers that will be written
+		 * by the device, causing false positives.
+		 */
 		memcpy(vaddr, phys_to_virt(orig_addr), size);
 	} else {
+		kmsan_unpoison_memory(vaddr, size);
 		memcpy(phys_to_virt(orig_addr), vaddr, size);
 	}
 }
@@ -1881,3 +1898,67 @@ static int __init rmem_swiotlb_setup(struct reserved_mem *rmem)
 
 RESERVEDMEM_OF_DECLARE(dma, "restricted-dma-pool", rmem_swiotlb_setup);
 #endif /* CONFIG_DMA_RESTRICTED_POOL */
+
+/**
+ * swiotlb_create_pool() - create a swiotlb pool from a physical memory region
+ * @base:	Physical base address of the region.
+ * @size:	Size of the region in bytes.
+ * @name:	Name for debugfs (may be NULL).
+ *
+ * Allocates and initializes an io_tlb_mem with its default pool backed by the
+ * caller-provided physical memory.  The region must already be reserved (e.g.
+ * via memblock_reserve or firmware memory map) and within the linear mapping.
+ *
+ * The returned pool has force_bounce set so that streaming DMA is bounced
+ * through this region.  Assign it to dev->dma_io_tlb_mem to direct a device's
+ * DMA bounce buffering into this region.  Coherent DMA allocations
+ * (dma_alloc_coherent) are not affected and will use normal memory.
+ *
+ * Return: pointer to a new io_tlb_mem on success, ERR_PTR on failure.
+ */
+struct io_tlb_mem *swiotlb_create_pool(phys_addr_t base, size_t size,
+				       const char *name)
+{
+	struct io_tlb_mem *mem;
+	struct io_tlb_pool *pool;
+	unsigned long nslabs = size >> IO_TLB_SHIFT;
+	unsigned int nareas = 1;
+
+	if (PageHighMem(pfn_to_page(PHYS_PFN(base))))
+		return ERR_PTR(-EINVAL);
+
+	mem = kzalloc(sizeof(*mem), GFP_KERNEL);
+	if (!mem)
+		return ERR_PTR(-ENOMEM);
+	pool = &mem->defpool;
+
+	pool->slots = kcalloc(nslabs, sizeof(*pool->slots), GFP_KERNEL);
+	if (!pool->slots) {
+		kfree(mem);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	pool->areas = kcalloc(nareas, sizeof(*pool->areas), GFP_KERNEL);
+	if (!pool->areas) {
+		kfree(pool->slots);
+		kfree(mem);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	set_memory_decrypted((unsigned long)phys_to_virt(base),
+			     size >> PAGE_SHIFT);
+	swiotlb_init_io_tlb_pool(pool, base, nslabs, false, nareas);
+	mem->force_bounce = true;
+	mem->for_alloc = false;
+#ifdef CONFIG_SWIOTLB_DYNAMIC
+	spin_lock_init(&mem->lock);
+	INIT_LIST_HEAD_RCU(&mem->pools);
+#endif
+	add_mem_pool(mem, pool);
+	swiotlb_create_debugfs_files(mem, name ?: "swiotlb-pool");
+
+	pr_info("created restricted pool at %pa, size %zuMiB\n",
+		&base, size / SZ_1M);
+	return mem;
+}
+EXPORT_SYMBOL_GPL(swiotlb_create_pool);
