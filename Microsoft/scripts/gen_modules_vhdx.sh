@@ -13,9 +13,9 @@ fi
 
 if test -z "$USE_SUDO";
 then
-    echo "Define the USE_SUDO env var to specify if you want to use or not sudo" 2>
-    echo "For using 'sudo' define $ export USE_SUDO=yes" 2>
-    echo "For not using 'sudo' define export USE_SUDO=no (but you'll have to 'sudo gen_modules_vhdx.sh ...')" 2>
+    echo "Define the USE_SUDO env var to specify if you want to use or not sudo" >&2
+    echo "For using 'sudo' define $ export USE_SUDO=yes" >&2
+    echo "For not using 'sudo' define export USE_SUDO=no (but you'll have to 'sudo gen_modules_vhdx.sh ...')" >&2
 else
     if test "$USE_SUDO" == "yes"
     then
@@ -24,7 +24,7 @@ else
          then
              SUDO_CMD=
          else
-             echo "USE_SUDO shall be 'yes' or 'no'"
+             echo "USE_SUDO shall be 'yes' or 'no'" >&2
          fi
     fi
 fi
